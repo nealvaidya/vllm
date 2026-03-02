@@ -59,6 +59,7 @@ class BlockStored(KVCacheEvent):
 
     medium: str | None
     lora_name: str | None
+    group_id: int | None = None
 
     def __hash__(self) -> int:
         return hash(
@@ -69,6 +70,7 @@ class BlockStored(KVCacheEvent):
                 self.block_size,
                 self.lora_id,
                 self.medium,
+                self.group_id,
             )
         )
 
@@ -76,9 +78,10 @@ class BlockStored(KVCacheEvent):
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[ExternalBlockHash]
     medium: str | None
+    group_id: int | None = None
 
     def __hash__(self) -> int:
-        return hash((tuple(self.block_hashes), self.medium))
+        return hash((tuple(self.block_hashes), self.medium, self.group_id))
 
 
 class AllBlocksCleared(KVCacheEvent):

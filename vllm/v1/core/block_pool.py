@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     FreeKVCacheBlockQueue,
     KVCacheBlock,
     get_block_hash,
+    get_group_id,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
@@ -294,6 +295,7 @@ class BlockPool:
                     lora_name=request.lora_request.name
                     if request.lora_request
                     else None,
+                    group_id=kv_cache_group_id,
                 )
             )
 
@@ -357,14 +359,11 @@ class BlockPool:
         block.reset_hash()
 
         if self.enable_kv_cache_events:
-            # FIXME (Chen): Not sure whether we should return `hash_value`
-            # or `(hash_value, group_id)` here. But it's fine now because
-            # we disable hybrid kv cache manager when kv cache event is
-            # enabled, so there is only one group.
             self.kv_event_queue.append(
                 BlockRemoved(
                     block_hashes=[maybe_convert_block_hash(get_block_hash(block_hash))],
                     medium=MEDIUM_GPU,
+                    group_id=get_group_id(block_hash),
                 )
             )
         return True
