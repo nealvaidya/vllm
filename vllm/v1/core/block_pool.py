@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     FreeKVCacheBlockQueue,
     KVCacheBlock,
     get_block_hash,
+    get_group_id,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
@@ -151,6 +152,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        group_id_to_attn_type: dict[int, str] | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -176,6 +178,7 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        self.group_id_to_attn_type = group_id_to_attn_type
 
         self.metrics_collector = metrics_collector
 
@@ -279,6 +282,11 @@ class BlockPool:
                     block_hashes[num_cached_blocks - 1]
                 )
 
+            attn_type = (
+                self.group_id_to_attn_type.get(kv_cache_group_id)
+                if self.group_id_to_attn_type is not None
+                else None
+            )
             self.kv_event_queue.append(
                 BlockStored(
                     block_hashes=new_hashes,
@@ -294,6 +302,7 @@ class BlockPool:
                     lora_name=request.lora_request.name
                     if request.lora_request
                     else None,
+                    attn_type=attn_type,
                 )
             )
 
@@ -357,14 +366,16 @@ class BlockPool:
         block.reset_hash()
 
         if self.enable_kv_cache_events:
-            # FIXME (Chen): Not sure whether we should return `hash_value`
-            # or `(hash_value, group_id)` here. But it's fine now because
-            # we disable hybrid kv cache manager when kv cache event is
-            # enabled, so there is only one group.
+            attn_type = (
+                self.group_id_to_attn_type.get(get_group_id(block_hash))
+                if self.group_id_to_attn_type is not None
+                else None
+            )
             self.kv_event_queue.append(
                 BlockRemoved(
                     block_hashes=[maybe_convert_block_hash(get_block_hash(block_hash))],
                     medium=MEDIUM_GPU,
+                    attn_type=attn_type,
                 )
             )
         return True

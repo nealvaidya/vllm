@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
 )
 from vllm.v1.request import Request
 
@@ -46,12 +47,26 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
+        # Build group_id -> attn_type mapping for KV event tagging.
+        group_id_to_attn_type: dict[int, str] | None = None
+        if len(kv_cache_config.kv_cache_groups) > 1:
+            group_id_to_attn_type = {}
+            for i, group in enumerate(kv_cache_config.kv_cache_groups):
+                spec = group.kv_cache_spec
+                if isinstance(spec, FullAttentionSpec):
+                    group_id_to_attn_type[i] = "full_attention"
+                elif isinstance(spec, MambaSpec):
+                    group_id_to_attn_type[i] = "mamba"
+                else:
+                    group_id_to_attn_type[i] = type(spec).__name__
+
         self.block_pool = BlockPool(
             kv_cache_config.num_blocks,
             enable_caching,
             hash_block_size,
             enable_kv_cache_events,
             metrics_collector,
+            group_id_to_attn_type,
         )
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
