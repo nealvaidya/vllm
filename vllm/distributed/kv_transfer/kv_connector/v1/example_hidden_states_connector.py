@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -33,8 +34,12 @@ def extract_from_kv_cache(
     """Extract data from KV cache
     Assume the shape of the kv_cache is (num_pages, page_size, num_heads, head_size)
     """
-
-    padded_kv = kv_cache.flatten(0, 1)[slot_mapping]
+    _, block_size, _, _ = kv_cache.shape
+    # Use 2D indexing instead of flatten+1D indexing so this works
+    # even when the cache tensor has inter-page padding (as_strided).
+    block_ids = slot_mapping // block_size
+    offsets = slot_mapping % block_size
+    padded_kv = kv_cache[block_ids, offsets]
     # shape: [len(slot_mapping), num_heads, head_size]
     return padded_kv[:num_tokens]  # shape: [num_tokens, num_heads, head_size]
 
@@ -99,7 +104,7 @@ class ExampleHiddenStatesConnectorMetadata(KVConnectorMetadata):
         )
 
 
-class ExampleHiddenStatesConnector(KVConnectorBase_V1):
+class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     """
     Simple debug implementation of a HiddenStatesConnector.
 
@@ -143,6 +148,15 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         self.num_hidden_states = len(
             getattr(spec_config, "eagle_aux_hidden_state_layer_ids", [])
         )
+
+        # For hybrid models, CacheOnlyAttentionLayer uses a smaller
+        # block_size so its page matches the attention page.  The
+        # connector must use the same block_size for slot mapping.
+        mamba_padded = vllm_config.cache_config.mamba_page_size_padded
+        if mamba_padded is not None and self.num_hidden_states > 0:
+            hidden_size = vllm_config.model_config.get_hidden_size()
+            per_token = self.num_hidden_states * hidden_size * 2
+            self._block_size = mamba_padded // per_token
 
         self._request_filenames: dict[str, str] = {}
         self._active_requests: dict[str, NewRequestData] = {}
@@ -265,16 +279,20 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = new_req.prompt_token_ids or []
             filename = os.path.join(self._storage_path, f"{new_req.req_id}.safetensors")
+            # Use the last group's block_ids — for hybrid models, the
+            # CacheOnlyAttentionLayer is the last spec type encountered
+            # (highest layer number) so it ends up in the last group.
+            # For non-hybrid models there is only one group, so -1 == 0.
             meta.add_request(
                 new_req.req_id,
                 filename=filename,
                 token_ids=token_ids,
-                block_ids=new_req.block_ids[0],
+                block_ids=new_req.block_ids[-1],
                 block_size=self._block_size,
             )
             self._request_filenames[new_req.req_id] = filename
             self._active_requests[new_req.req_id] = new_req
-            self._req_blocks[new_req.req_id] = list(new_req.block_ids[0])
+            self._req_blocks[new_req.req_id] = list(new_req.block_ids[-1])
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -287,7 +305,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
             req_block_ids = self._req_blocks[req_id]
 
             assert new_block_ids is not None
-            block_ids = new_block_ids[0]
+            block_ids = new_block_ids[-1]
 
             req_block_ids.extend(block_ids)
             filename = os.path.join(self._storage_path, f"{req_id}.safetensors")
@@ -328,6 +346,15 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         _ = self._req_blocks.pop(req_id, None)
 
         return False, {"hidden_states_path": req_filename}
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        # Hidden states connectors don't use standard KV cache blocks.
+        # Delegate to the single-group version with an empty block list.
+        return self.request_finished(request, [])
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:

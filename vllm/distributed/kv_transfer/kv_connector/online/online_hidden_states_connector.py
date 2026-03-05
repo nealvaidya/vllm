@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connector import (  # noqa: E501
     ExampleHiddenStatesConnector,
@@ -17,11 +18,12 @@ from vllm.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
 
-class OnlineHiddenStatesConnector(ExampleHiddenStatesConnector):
+class OnlineHiddenStatesConnector(ExampleHiddenStatesConnector, SupportsHMA):
     """Async two-file hidden states capture for EAGLE drafter training.
 
     Scheduler and worker run as separate instances in the same process.
@@ -47,6 +49,16 @@ class OnlineHiddenStatesConnector(ExampleHiddenStatesConnector):
         self.total_captured = 0
         self.total_skipped = 0
         self.writer = None
+
+        # For hybrid models, CacheOnlyAttentionLayer uses a smaller
+        # block_size so its page matches the attention page.  The
+        # connector must use the same block_size for slot mapping.
+        mamba_padded = vllm_config.cache_config.mamba_page_size_padded
+        if mamba_padded is not None and self.num_hidden_states > 0:
+            hidden_size = vllm_config.model_config.get_hidden_size()
+            # dtype_size = 2 for bf16/fp16 (same as CacheOnlyAttention)
+            per_token = self.num_hidden_states * hidden_size * 2
+            self._block_size = mamba_padded // per_token
 
     def create_percentile_tracker(self, kv):
         pct = kv("capture_percentile", 0.0)
@@ -169,14 +181,27 @@ class OnlineHiddenStatesConnector(ExampleHiddenStatesConnector):
             sub = r.lora_request.lora_name if r.lora_request else "base"
             pfn = os.path.join(self._storage_path, sub, f"{r.req_id}.safetensors")
             dfn = os.path.join(self._storage_path, sub, f"{r.req_id}_decode.safetensors")
+            # Use the last group's block_ids — for hybrid models, the
+            # CacheOnlyAttentionLayer is the last spec type encountered
+            # (highest layer number) so it ends up in the last group.
+            # For non-hybrid models there is only one group, so -1 == 0.
             meta.add_request(r.req_id, filename=pfn, token_ids=tids,
-                             block_ids=r.block_ids[0], block_size=self._block_size)
+                             block_ids=r.block_ids[-1], block_size=self._block_size)
             self.request_filenames[r.req_id] = (pfn, dfn)
             self._active_requests[r.req_id] = r
 
     # ==============================
     # Request completion
     # ==============================
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        # Hidden states connectors don't use standard KV cache blocks.
+        # Delegate to the single-group version with an empty block list.
+        return self.request_finished(request, [])
 
     def request_finished(self, request, block_ids):
         rid = request.request_id

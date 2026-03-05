@@ -240,7 +240,10 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
-            # don't need to pad mamba page size
+            # No padding needed, but still store the page size so that
+            # CacheOnlyAttentionLayer can use it as a target for hybrid
+            # models (e.g. extract_hidden_states spec decoding).
+            cache_config.mamba_page_size_padded = attn_page_size
             return
 
         # pad mamba page size to exactly match attention

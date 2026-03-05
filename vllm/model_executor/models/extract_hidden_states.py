@@ -17,13 +17,14 @@ import torch.nn as nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -37,6 +38,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
+logger = init_logger(__name__)
 
 ########## Custom Ops ########
 
@@ -79,13 +82,16 @@ def dummy_attention(layer_name, _placeholder):
 
 
 def basic_cache(
-    to_cache: torch.Tensor,  # shape: [num_blocks, block_size, num_heads, head_size]
-    kv_cache: torch.Tensor,  # shape: [seq_len, num_heads, head_size]
+    to_cache: torch.Tensor,  # shape: [seq_len, num_heads, head_size]
+    kv_cache: torch.Tensor,  # shape: [num_blocks, block_size, num_heads, head_size]
     slot_mapping: torch.Tensor,  # shape: [seq_len]
 ):
-    num_blocks, block_size, num_heads, head_size = kv_cache.shape
-    token_kv_cache = kv_cache.view(num_blocks * block_size, num_heads, head_size)
-    token_kv_cache[slot_mapping] = to_cache
+    _, block_size, _, _ = kv_cache.shape
+    # Use 2D indexing instead of flatten+1D indexing so this works
+    # even when the cache tensor has inter-page padding (as_strided).
+    block_ids = slot_mapping // block_size
+    offsets = slot_mapping % block_size
+    kv_cache[block_ids, offsets] = to_cache
 
 
 ######### CacheOnlyAttentionBackend ########
@@ -269,6 +275,31 @@ class CacheOnlyAttentionLayer(nn.Module, AttentionLayerBase):
             kv_cache_dtype, vllm_config.model_config
         )
 
+        # For hybrid models (e.g. Mamba+Attention), the attention block_size
+        # is set large to accommodate mamba state size.  The cache-only
+        # layer's per-token footprint is much larger than attention's, so
+        # using the same block_size would create a page 24x bigger than the
+        # attention page — breaking page-size unification.  Shrink
+        # block_size so that our page matches the attention page.
+        if (cache_config is not None
+                and cache_config.mamba_page_size_padded is not None):
+            per_token = (num_heads * head_size
+                         * get_dtype_size(self.kv_cache_torch_dtype))
+            target_page = cache_config.mamba_page_size_padded
+            old_block_size = self.block_size
+            self.block_size = target_page // per_token
+            self._page_size_padded = (
+                target_page
+                if self.block_size * per_token != target_page
+                else None
+            )
+            logger.info(
+                "CacheOnlyAttention hybrid fix: block_size %d->%d, "
+                "per_token=%d, target_page=%d, page_padded=%s",
+                old_block_size, self.block_size, per_token,
+                target_page, self._page_size_padded,
+            )
+
         # Initialize KV cache quantization attributes
         set_default_quant_scales(self, register_buffer=True)
 
@@ -334,6 +365,7 @@ class CacheOnlyAttentionLayer(nn.Module, AttentionLayerBase):
             num_kv_heads=self.num_heads,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,
+            page_size_padded=getattr(self, '_page_size_padded', None),
         )
 
 

@@ -6340,12 +6340,34 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
-                    kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
+                    typed_tensor = (
+                        kv_cache_raw_tensors[layer_name].view(dtype)
                     )
+                    if (kv_cache_spec.page_size_padded is not None
+                            and num_blocks_per_kv_block == 1):
+                        # When pages are padded, .view() fails because
+                        # the allocation includes padding bytes between
+                        # pages.  Use as_strided so that stride[0] jumps
+                        # by the padded page size, skipping the padding.
+                        elements_per_page = (
+                            kv_cache_spec.page_size_padded
+                            // get_dtype_size(dtype)
+                        )
+                        default_stride = list(
+                            torch.empty(kv_cache_shape).stride()
+                        )
+                        default_stride[0] = elements_per_page
+                        kv_caches[layer_name] = torch.as_strided(
+                            typed_tensor,
+                            size=kv_cache_shape,
+                            stride=default_stride,
+                        ).permute(*inv_order)
+                    else:
+                        kv_caches[layer_name] = (
+                            typed_tensor
+                            .view(kv_cache_shape)
+                            .permute(*inv_order)
+                        )
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
