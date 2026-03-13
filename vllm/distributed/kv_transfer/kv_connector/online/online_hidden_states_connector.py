@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connecto
     extract_from_kv_cache,
 )
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -56,8 +57,12 @@ class OnlineHiddenStatesConnector(ExampleHiddenStatesConnector, SupportsHMA):
         mamba_padded = vllm_config.cache_config.mamba_page_size_padded
         if mamba_padded is not None and self.num_hidden_states > 0:
             hidden_size = vllm_config.model_config.get_hidden_size()
-            # dtype_size = 2 for bf16/fp16 (same as CacheOnlyAttention)
-            per_token = self.num_hidden_states * hidden_size * 2
+            kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+                vllm_config.cache_config.cache_dtype,
+                vllm_config.model_config,
+            )
+            dtype_size = get_dtype_size(kv_cache_torch_dtype)
+            per_token = self.num_hidden_states * hidden_size * dtype_size
             self._block_size = mamba_padded // per_token
 
     def create_percentile_tracker(self, kv):
@@ -181,12 +186,9 @@ class OnlineHiddenStatesConnector(ExampleHiddenStatesConnector, SupportsHMA):
             sub = r.lora_request.lora_name if r.lora_request else "base"
             pfn = os.path.join(self._storage_path, sub, f"{r.req_id}.safetensors")
             dfn = os.path.join(self._storage_path, sub, f"{r.req_id}_decode.safetensors")
-            # Use the last group's block_ids — for hybrid models, the
-            # CacheOnlyAttentionLayer is the last spec type encountered
-            # (highest layer number) so it ends up in the last group.
-            # For non-hybrid models there is only one group, so -1 == 0.
+            gid = self._cache_group_idx
             meta.add_request(r.req_id, filename=pfn, token_ids=tids,
-                             block_ids=r.block_ids[-1], block_size=self._block_size)
+                             block_ids=r.block_ids[gid], block_size=self._block_size)
             self.request_filenames[r.req_id] = (pfn, dfn)
             self._active_requests[r.req_id] = r
 

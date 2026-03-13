@@ -1143,6 +1143,8 @@ class Qwen3NextModel(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
         if get_pp_group().is_last_rank:
             self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -1169,7 +1171,19 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_state_layers = getattr(
+            self, "aux_hidden_state_layers", ())
+        aux_hidden_states: list[torch.Tensor] = []
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            if layer_idx in aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    hidden_states + residual
+                    if residual is not None
+                    else hidden_states
+                )
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1181,6 +1195,8 @@ class Qwen3NextModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

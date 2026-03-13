@@ -37,6 +37,13 @@ class ExtractHiddenStatesConfig(PretrainedConfig):
 
         super().__init__(**combined)
 
+        # For VL models, to_dict() serializes text_config to a plain dict.
+        # get_text_config() then returns this dict, which fails attribute
+        # checks (e.g. hasattr(text_config, "num_attention_heads")).
+        # Reconstruct it as a PretrainedConfig so downstream code works.
+        if hasattr(self, "text_config") and isinstance(self.text_config, dict):
+            self.text_config = PretrainedConfig(**self.text_config)
+
     @classmethod
     def from_pretrained(
         cls,

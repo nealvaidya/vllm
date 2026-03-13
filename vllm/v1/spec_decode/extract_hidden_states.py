@@ -47,6 +47,7 @@ class ExtractHiddenStatesProposer:
         self.model: nn.Module | None = None
         self.attn_layer_names: list[str] = []
         self.attn_metadata_builder: AttentionMetadataBuilder | None = None
+        self.kv_cache_gid: int = -1
 
         # Maximum number of tokens for buffers
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
@@ -157,9 +158,12 @@ class ExtractHiddenStatesProposer:
                 hidden_states=self.hidden_states[:num_input_tokens],
             )
 
-        # Return the sampled tokens as "draft" tokens
-        # Shape: [batch_size, 1] to match num_speculative_tokens=1
-        return sampled_token_ids.unsqueeze(-1), kv_connector_output
+        # Return the sampled tokens as "draft" tokens.
+        # sampled_token_ids shape: [batch_size, num_sampled_per_req]
+        # On decode steps with spec tokens, num_sampled_per_req > 1.
+        # We only need the first sampled token per request as the draft.
+        # Shape: [batch_size, 1]
+        return sampled_token_ids[:, :1], kv_connector_output
 
     def _get_slot_mapping(
         self,
@@ -390,6 +394,16 @@ class ExtractHiddenStatesProposer:
         """Validate all drafting layers belong to the same KV cache group.
 
         With exactly one attention layer (asserted in load_model), this is
-        trivially satisfied.
+        trivially satisfied. Also sets self.kv_cache_gid so that
+        gpu_model_runner can select the correct slot_mapping for this group.
         """
         assert len(self.attn_layer_names) == 1
+        draft_names = set(self.attn_layer_names)
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            if draft_names & set(group.layer_names):
+                self.kv_cache_gid = gid
+                return
+        raise ValueError(
+            f"Draft attention layers {self.attn_layer_names} not found in "
+            "any KV cache group"
+        )

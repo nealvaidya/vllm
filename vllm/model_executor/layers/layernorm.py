@@ -525,7 +525,8 @@ class RMSNormGated(CustomOp):
                               If False and z is provided: out = norm(x * silu(z))
             device: Device to create parameters on
             dtype: Data type for parameters
-            activation: Activation function name for gating
+            activation: Activation function name for gating (e.g. "swish",
+                        "sigmoid")
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -535,6 +536,7 @@ class RMSNormGated(CustomOp):
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
+        self.activation = activation
         self.reset_parameters()
 
     def reset_parameters(self):
